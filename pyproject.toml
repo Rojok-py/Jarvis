@@ -1,0 +1,26 @@
+[project]
+name = "jarvis-project"
+version = "0.1.0"
+description = "AI Assistant J.A.R.V.I.S with Groq and RAG"
+authors = [
+    {name = "Ivan Rozhentsev", email = "kruzkachay@gmail.com"}
+]
+requires-python = ">=3.12,<4.0"
+
+dependencies = [
+    "groq>=1.0.0",
+    "scikit-learn>=1.8.0",
+    "edge-tts>=6.1.12",
+    "PyQt6>=6.7.0",
+    "python-dotenv>=1.0.1",
+    "duckduckgo-search>=7.0.0",
+    "pymupdf (>=1.27.1,<2.0.0)",
+    "numpy (>=2.4.2,<3.0.0)",
+]
+
+[tool.poetry]
+packages = [{include = "src"}]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
