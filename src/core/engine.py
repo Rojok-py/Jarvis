@@ -101,6 +101,26 @@ _RE_RAG_QUERY = re.compile(
     re.IGNORECASE,
 )
 
+# «Создай файл notes.txt с содержимым ...» / «Напиши файл ...»
+_RE_CREATE_FILE = re.compile(
+    r"(?:создай|напиши|запиши|сделай|create|write)\s+(?:текстовый\s+)?файл\s+(?P<file>[\w.\-/]+)"
+    r"(?:\s+(?:с\s+содержимым|с\s+текстом|with|содержимое|содержание|with\s+content))?\s*(?P<content>.*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# «Измени файл notes.txt ...» / «Отредактируй файл ...» / «Допиши в файл ...»
+_RE_EDIT_FILE = re.compile(
+    r"(?:измени|отредактируй|редактируй|поменяй|обнови|edit|modify|update)\s+(?:файл\s+)?(?P<file>[\w.\-/]+)"
+    r"\s*(?P<instruction>.*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# «Допиши в файл notes.txt ...» / «Добавь в файл ...»
+_RE_APPEND_FILE = re.compile(
+    r"(?:допиши|добавь|append)\s+(?:в\s+)?(?:файл\s+)?(?P<file>[\w.\-/]+)\s+(?P<content>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 class JarvisEngine:
     """Обёртка над Groq API для J.A.R.V.I.S."""
@@ -446,7 +466,157 @@ class JarvisEngine:
             log.info("Команда: RAG-запрос '%s'", query)
             return self.rag_query(query)
 
+        # ── Создание файла ──
+        m = _RE_CREATE_FILE.search(text)
+        if m:
+            filename = m.group("file").strip().rstrip(".,;:!?")
+            raw_content = (m.group("content") or "").strip().rstrip(".,;:!?")
+            log.info("Команда: создать файл '%s'", filename)
+            return self._handle_create_file(filename, raw_content, text)
+
+        # ── Дописать в файл ──
+        m = _RE_APPEND_FILE.search(text)
+        if m:
+            filename = m.group("file").strip().rstrip(".,;:!?")
+            raw_content = (m.group("content") or "").strip()
+            log.info("Команда: дописать в файл '%s'", filename)
+            return self._handle_append_file(filename, raw_content, text)
+
+        # ── Редактирование файла ──
+        m = _RE_EDIT_FILE.search(text)
+        if m:
+            filename = m.group("file").strip().rstrip(".,;:!?")
+            instruction = (m.group("instruction") or "").strip()
+            log.info("Команда: редактировать файл '%s'", filename)
+            return self._handle_edit_file(filename, instruction, text)
+
         return None
+
+    # ── Создание и редактирование файлов ────────────────────────
+
+    def _handle_create_file(
+        self, filename: str, raw_content: str, full_text: str
+    ) -> str:
+        """Создать текстовый файл.  Если содержимое не указано явно — просим LLM сгенерировать."""
+        from src.tools.file_ops import create_text_file
+
+        if raw_content:
+            content = raw_content
+        else:
+            # Просим LLM сформировать содержимое файла по запросу
+            content = self._generate_file_content(filename, full_text)
+
+        path = create_text_file(filename, content)
+        return (
+            f"✅ Файл **{filename}** создан в `{path.parent.name}/`.\n\n"
+            f"Содержимое ({len(content)} символов):\n```\n{content[:500]}"
+            + ("\n… [обрезано]" if len(content) > 500 else "")
+            + "\n```"
+        )
+
+    def _handle_append_file(
+        self, filename: str, raw_content: str, full_text: str
+    ) -> str:
+        """Дописать текст в конец существующего файла."""
+        from src.tools.file_ops import edit_text_file
+
+        if raw_content:
+            content = raw_content
+        else:
+            content = self._generate_file_content(filename, full_text)
+
+        try:
+            path = edit_text_file(filename, append="\n" + content)
+        except FileNotFoundError:
+            # Если файла нет — создаём
+            from src.tools.file_ops import create_text_file
+
+            path = create_text_file(filename, content)
+            return (
+                f"Файл **{filename}** не существовал — создал новый в "
+                f"`{path.parent.name}/` и записал содержимое."
+            )
+        return f"✅ Дописал в **{filename}** ({path.parent.name}/)."
+
+    def _handle_edit_file(
+        self, filename: str, instruction: str, full_text: str
+    ) -> str:
+        """Отредактировать файл — LLM генерирует новое содержимое на основе текущего."""
+        from src.tools.file_ops import edit_text_file, read_text_file
+
+        try:
+            path, current = read_text_file(filename)
+        except FileNotFoundError:
+            return (
+                f"Файл **{filename}** не найден ни в data/, ни в out/. "
+                "Может, создать его? Скажите: «создай файл {filename} …»"
+            )
+
+        # Ограничим длину текущего содержимого для контекста
+        truncated = current[:30000]
+        if len(current) > 30000:
+            truncated += "\n\n... [текст обрезан]"
+
+        prompt = (
+            f"Текущее содержимое файла «{filename}»:\n\n"
+            f"```\n{truncated}\n```\n\n"
+            f"Пользователь просит: {full_text}\n\n"
+            "Верни ТОЛЬКО новое полное содержимое файла — без объяснений, "
+            "без обёрток в markdown-блоки. Только текст файла."
+        )
+
+        response = _retry_on_429(
+            self._client.chat.completions.create,
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=4096,
+        )
+        new_content = response.choices[0].message.content.strip()
+
+        # Убираем markdown-обёртку если LLM всё же добавил
+        new_content = self._strip_markdown_wrapper(new_content)
+
+        edit_text_file(filename, new_content=new_content)
+        return (
+            f"✅ Файл **{filename}** обновлён.\n\n"
+            f"Новое содержимое ({len(new_content)} символов):\n```\n{new_content[:500]}"
+            + ("\n… [обрезано]" if len(new_content) > 500 else "")
+            + "\n```"
+        )
+
+    def _generate_file_content(self, filename: str, user_request: str) -> str:
+        """Попросить LLM сгенерировать содержимое файла по запросу."""
+        prompt = (
+            f"Пользователь просит создать файл «{filename}».\n"
+            f"Полный запрос: {user_request}\n\n"
+            "Сгенерируй содержимое этого файла. "
+            "Верни ТОЛЬКО текст файла — без объяснений, без обёрток в markdown-блоки."
+        )
+        response = _retry_on_429(
+            self._client.chat.completions.create,
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.5,
+            max_tokens=4096,
+        )
+        content = response.choices[0].message.content.strip()
+        return self._strip_markdown_wrapper(content)
+
+    @staticmethod
+    def _strip_markdown_wrapper(text: str) -> str:
+        """Убрать ```…``` обёртку если LLM добавил."""
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.split("\n")
+            # Убираем первую строку (```lang) и последнюю (```)
+            return "\n".join(lines[1:-1]).strip()
+        return text
 
     def reset_chat(self) -> None:
         """Сбросить историю диалога."""
