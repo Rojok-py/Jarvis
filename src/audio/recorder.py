@@ -30,6 +30,52 @@ def _check_ffmpeg() -> str:
     return path
 
 
+def start_recording(output: Path | None = None) -> tuple[subprocess.Popen, Path]:
+    """
+    Начать запись без ограничения по времени.
+    Возвращает (процесс ffmpeg, путь к файлу).
+    Для остановки вызовите stop_recording().
+    """
+    ffmpeg = _check_ffmpeg()
+    output = output or DEFAULT_OUTPUT
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f", "pulse",
+        "-ac", "1",
+        "-ar", "16000",
+        "-i", "default",
+        "-acodec", "pcm_s16le",
+        "-af", "highpass=f=80,lowpass=f=8000,volume=2.0",
+        str(output),
+    ]
+
+    log.info("Запись (удержание) → %s", output)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return proc, output
+
+
+def stop_recording(proc: subprocess.Popen, output: Path) -> Path:
+    """
+    Остановить запись (SIGTERM → ffmpeg корректно закрывает файл).
+    Возвращает путь к записанному файлу.
+    """
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+    if not output.exists() or output.stat().st_size == 0:
+        raise RuntimeError(f"Файл записи пуст или не создан: {output}")
+
+    log.info("Запись завершена: %s (%d байт)", output, output.stat().st_size)
+    return output
+
+
 def record(duration: int = 5, output: Path | None = None) -> Path:
     """
     Записать аудио с микрофона через PulseAudio.

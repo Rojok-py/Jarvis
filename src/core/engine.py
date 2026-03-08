@@ -59,7 +59,11 @@ SYSTEM_PROMPT = (
     "You speak in a technical but accessible manner. "
     "Keep responses concise unless asked for detail. "
     "If the user speaks Russian, answer in Russian while maintaining your character. "
-    "Always address the user respectfully."
+    "Always address the user respectfully. "
+    "IMPORTANT: You do NOT have access to any files or documents unless they are explicitly "
+    "provided to you in this conversation. Do not invent or assume file contents. "
+    "You also do NOT have real-time data (weather, stock prices, news) unless web search "
+    "results are provided to you."
 )
 
 # ── Регулярные выражения для голосовых команд ────────────────
@@ -74,6 +78,17 @@ _RE_ANALYZE = re.compile(
 # «Найди в интернете ...» / «Поищи ...» / «Search for ...»
 _RE_SEARCH = re.compile(
     r"(?:найди\s+(?:в\s+интернете\s+)?(?:информацию\s+)?(?:про\s+|о\s+)?|поищи\s+(?:в\s+интернете\s+)?(?:информацию\s+)?(?:про\s+|о\s+)?|search\s+(?:for\s+)?|загугли\s+|гугли\s+|поиск\s+)(?P<query>.+)",
+    re.IGNORECASE,
+)
+
+_RE_REALTIME = re.compile(
+    r"(?:"
+    r"(?:какая|какой|какое|какие|как|сколько)?\s*погода"
+    r"|прогноз\s+погоды"
+    r"|температура\s+(?:в\s+)?[a-zA-Z\u0400-\u04ff]+"
+    r"|курс\s+(?:валюты?|доллара?|евро?|рубля?|биткоина?)"
+    r"|последние\s+(?:новости|события)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -110,7 +125,8 @@ _RE_CREATE_FILE = re.compile(
 
 # «Измени файл notes.txt ...» / «Отредактируй файл ...» / «Допиши в файл ...»
 _RE_EDIT_FILE = re.compile(
-    r"(?:измени|отредактируй|редактируй|поменяй|обнови|edit|modify|update)\s+(?:файл\s+)?(?P<file>[\w.\-/]+)"
+    r"(?:измени|отредактируй|редактируй|поменяй|обнови|edit|modify|update)"
+    r"\s+(?:(?:мой|этот|свой|данный)\s+)?(?:файл\s+(?:с\s+)?)?(?P<file>[\w.\-/]+)"
     r"\s*(?P<instruction>.*)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -204,7 +220,7 @@ class JarvisEngine:
             return f"Ошибка при индексации: {exc}"
 
     def rag_query(self, query: str) -> str:
-        """Запрос с RAG-контекстом."""
+        """Запрос с RAG-контекстом. Контекст документов НЕ сохраняется в историю чата."""
         if not self._rag.is_indexed:
             self.index_documents()
 
@@ -219,7 +235,8 @@ class JarvisEngine:
             "Если информации в документах недостаточно, скажи об этом."
         )
         log.info("RAG-запрос: %s", query[:80])
-        return self._chat_complete(augmented)
+        # Используем _search_complete — не засоряет историю массивным контекстом документов
+        return self._search_complete(query, augmented)
 
     # ── Текстовый режим ──────────────────────────────────────
 
@@ -492,25 +509,12 @@ class JarvisEngine:
         if m:
             query = m.group("query").strip().rstrip(".,;:!?")
             log.info("Команда: веб-поиск '%s'", query)
-            from src.tools.search import web_search
-            results = web_search(query)
-            if not results or "не удалось" in results.lower() or results.strip() == "Результатов не найдено.":
-                return self._chat_complete(
-                    f"Пользователь спросил: «{text}». "
-                    "Поиск не дал результатов. Скажи об этом честно и предложи альтернативы."
-                )
-            summary_prompt = (
-                f"Ниже приведены РЕАЛЬНЫЕ актуальные результаты поиска DuckDuckGo "
-                f"по запросу «{query}».\n\n"
-                f"{results}\n\n"
-                "Используй эти данные как единственный источник информации. "
-                "Извлеки ключевые факты и дай чёткий, структурированный ответ. "
-                "Если это погода — укажи температуру, осадки, условия. "
-                "Если это новости — кратко изложи суть. "
-                "Указывай источники (URL). Отвечай на русском языке."
-            )
-            # Прямой вызов без добавления в историю чата
-            return self._search_complete(query, summary_prompt)
+            return self._web_search_and_summarize(query, text)
+
+        # Автопоиск для погоды, курсов, новостей — без явного триггера
+        if _RE_REALTIME.search(text):
+            log.info("Команда: автопоиск (актуальные данные) '%s'", text[:60])
+            return self._web_search_and_summarize(text, text)
 
         if _RE_LIST_FILES.search(text):
             log.info("Команда: список файлов")
@@ -602,6 +606,87 @@ class JarvisEngine:
 
     # ── Создание и редактирование файлов ────────────────────────
 
+    def _resolve_file(self, hint: str, full_text: str) -> Path | None:
+        """
+        Попытаться найти файл в data/ по нескольким стратегиям:
+        1. Прямой/нечёткий поиск по hint.
+        2. Поиск по всему тексту команды.
+        3. Единственный файл → взять его.
+        4. LLM выбирает из списка.
+        """
+        # 1. Прямой поиск по hint
+        found = self._find_file_in_data(hint)
+        if found:
+            return found
+
+        # 2. Попытка найти имя файла в полном тексте команды
+        found = self._detect_filename_in_text(full_text)
+        if found:
+            return found
+
+        files = self._get_all_data_files()
+        if not files:
+            return None
+
+        # 3. Только один файл — очевидно он
+        if len(files) == 1:
+            return files[0]
+
+        # 4. LLM определяет по контексту
+        file_list = "\n".join(f"- {f.name}" for f in files)
+        prompt = (
+            f"Файлы в data/:\n{file_list}\n\n"
+            f"Пользователь сказал: «{full_text}»\n\n"
+            "Какой файл из списка пользователь имеет в виду? "
+            "Ответь ТОЛЬКО именем файла (например: notes.txt). "
+            "Если невозможно определить — ответь 'неизвестно'."
+        )
+        try:
+            resp = _retry_on_429(
+                self._client.chat.completions.create,
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=60,
+            )
+            guess = resp.choices[0].message.content.strip().strip('"').strip("'")
+            if guess.lower() != "неизвестно":
+                found = self._find_file_in_data(guess)
+                if found:
+                    return found
+        except Exception:
+            pass
+
+        return None
+
+    def _web_search_and_summarize(self, query: str, original_text: str) -> str:
+        """Выполнить веб-поиск и сформировать ответ через LLM.
+        Если DDG ничего не нашёл — отвечает от себя с пометкой об устаревших данных.
+        """
+        from src.tools.search import web_search
+        results = web_search(query)
+        if results and "не удалось" not in results.lower() and results.strip() != "Результатов не найдено.":
+            summary_prompt = (
+                f"Ниже результаты поиска DuckDuckGo по запросу «{query}»:\n\n{results}\n\n"
+                "Ответь чётко на вопрос пользователя, опираясь на эти данные. "
+                "Если погода — ответь температурой, осадками, условиями. "
+                "Указывай источники (URL). Отвечай на русском."
+            )
+            return self._search_complete(query, summary_prompt)
+
+        # DDG ничего не вернул — отвечаем от LLM с честной пометкой
+        log.info("Веб-поиск не дал результатов, использую LLM-знания для: %s", query[:60])
+        return self._search_complete(
+            query,
+            f"Пользователь спрашивает: «{original_text}».\n"
+            "Веб-поиск не принёс результатов. "
+            "Ответь на основе своих знаний, но предупреди что данные могут быть устаревшими "
+            "и порекомендуй проверить на актуальных источниках. Отвечай на русском."
+        )
+
     def _detect_filename_in_text(self, text: str) -> "Path | None":
         """
         Проверить, упоминается ли в тексте имя или часть имени файла из data/.
@@ -644,34 +729,37 @@ class JarvisEngine:
         self, filename: str, raw_content: str, full_text: str
     ) -> str:
         """Дописать текст в конец существующего файла. LLM расширяет введённую идею."""
-        from src.tools.file_ops import edit_text_file
+        from src.tools.file_ops import create_text_file
 
         content = self._generate_file_content(filename, full_text, hint=raw_content)
 
-        try:
-            path = edit_text_file(filename, append="\n" + content)
-        except FileNotFoundError:
-            from src.tools.file_ops import create_text_file
+        file_path = self._resolve_file(filename, full_text)
+        if file_path is not None:
+            # Файл найден — дописываем
+            existing = file_path.read_text(encoding="utf-8", errors="replace")
+            file_path.write_text(existing + "\n" + content, encoding="utf-8")
+            return f"✅ Дописал в **{file_path.name}** ({file_path.parent.name}/):\n```\n{content[:300]}```"
+        else:
+            # Файл не найден — создаём новый
             path = create_text_file(filename, content)
             return (
                 f"Файл **{filename}** не существовал — создал новый в "
                 f"`{path.parent.name}/` и записал содержимое."
             )
-        return f"✅ Дописал в **{filename}** ({path.parent.name}/):\n```\n{content[:300]}```"
 
     def _handle_edit_file(
         self, filename: str, instruction: str, full_text: str
     ) -> str:
         """Отредактировать файл — LLM генерирует новое содержимое на основе текущего."""
-        from src.tools.file_ops import edit_text_file, read_text_file
 
-        try:
-            path, current = read_text_file(filename)
-        except FileNotFoundError:
+        # Сначала пробуем прямой поиск, потом умный резолвер
+        file_path = self._resolve_file(filename, full_text)
+        if file_path is None:
             return (
-                f"Файл **{filename}** не найден ни в data/, ни в out/. "
-                "Может, создать его? Скажите: «создай файл {filename} …»"
+                f"Не могу найти файл по запросу «{full_text}». "
+                "Уточните имя файла или скажите «покажи файлы»."
             )
+        path, current = file_path, file_path.read_text(encoding="utf-8", errors="replace")
 
         # Ограничим длину текущего содержимого для контекста
         truncated = current[:30000]
@@ -701,9 +789,11 @@ class JarvisEngine:
         # Убираем markdown-обёртку если LLM всё же добавил
         new_content = self._strip_markdown_wrapper(new_content)
 
-        edit_text_file(filename, new_content=new_content)
+        real_name = file_path.name
+        file_path.write_text(new_content, encoding="utf-8")
+        log.info("Файл обновлён: %s", file_path)
         return (
-            f"✅ Файл **{filename}** обновлён.\n\n"
+            f"✅ Файл **{real_name}** обновлён.\n\n"
             f"Новое содержимое ({len(new_content)} символов):\n```\n{new_content[:500]}"
             + ("\n… [обрезано]" if len(new_content) > 500 else "")
             + "\n```"
@@ -718,7 +808,7 @@ class JarvisEngine:
         - если пользователь дал текст/тему — LLM расширяет это в полноценную запись
         - если ничего нет — LLM генерирует с нуля по имени файла и полному запросу
         """
-        from src.tools.file_ops import create_text_file, edit_text_file
+        from src.tools.file_ops import create_text_file
 
         if raw_content:
             # Просим LLM расширить/улучшить введённый пользователем текст
@@ -751,16 +841,17 @@ class JarvisEngine:
             response.choices[0].message.content.strip()
         )
 
-        try:
-            path = edit_text_file(filename, new_content=content)
-            action = "Обновлён"
-        except FileNotFoundError:
+        existing = self._resolve_file(filename, full_text)
+        if existing is not None:
+            existing.write_text(content, encoding="utf-8")
+            path, action, real_name = existing, "Обновлён", existing.name
+        else:
             path = create_text_file(filename, content)
-            action = "Создан"
+            action, real_name = "Создан", filename
 
         log.info("%s файл: %s", action, path)
         return (
-            f"✅ {action} файл **{filename}** в `{path.parent.name}/`.\n\n"
+            f"✅ {action} файл **{real_name}** в `{path.parent.name}/`.\n\n"
             f"Содержимое ({len(content)} символов):\n"
             f"```\n{content[:500]}"
             + ("\n… [обрезано]" if len(content) > 500 else "")

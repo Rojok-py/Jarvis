@@ -1,10 +1,3 @@
-"""
-Interface — главное окно J.A.R.V.I.S. на PyQt6.
-
-Два режима: текстовый чат и голосовой ввод.
-Футуристическая тёмная тема с фоновым изображением.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -177,8 +170,7 @@ class BackgroundWidget(QWidget):
 # ── Worker-потоки (чтобы UI не зависал) ─────────────────────
 
 class TextWorker(QThread):
-    """Отправляет текст в engine в фоне."""
-    finished = pyqtSignal(str)   # ответ Gemini
+    finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
     def __init__(self, engine, text: str) -> None:
@@ -188,7 +180,6 @@ class TextWorker(QThread):
 
     def run(self) -> None:
         try:
-            # Сначала проверяем команды, потом обычный чат
             result = self._engine.process_voice_command(self._text)
             if result is None:
                 result = self._engine.send_text(self._text)
@@ -198,25 +189,20 @@ class TextWorker(QThread):
 
 
 class VoiceWorker(QThread):
-    """Записывает голос → отправляет в engine → получает ответ."""
-    status = pyqtSignal(str)          # статус для UI
-    finished = pyqtSignal(str, str)   # (транскрипция, ответ)
+    status = pyqtSignal(str)
+    finished = pyqtSignal(str, str)
     error = pyqtSignal(str)
 
-    def __init__(self, engine, recorder_mod, speaker_mod, duration: int = 5) -> None:
+    def __init__(self, engine, speaker_mod, audio_path: Path) -> None:
         super().__init__()
         self._engine = engine
-        self._recorder = recorder_mod
         self._speaker = speaker_mod
-        self._duration = duration
+        self._audio_path = audio_path
 
     def run(self) -> None:
         try:
-            self.status.emit("Запись...")
-            audio_path = self._recorder.record(duration=self._duration)
-
             self.status.emit("Распознавание...")
-            transcript, reply = self._engine.send_audio(audio_path)
+            transcript, reply = self._engine.send_audio(self._audio_path)
 
             self.status.emit("Озвучивание...")
             self._speaker.speak(reply)
@@ -227,7 +213,6 @@ class VoiceWorker(QThread):
 
 
 class IndexWorker(QThread):
-    """Индексирует файлы из data/ в фоне."""
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
@@ -253,6 +238,8 @@ class JarvisWindow(QMainWindow):
         self._engine = engine
         self._mode = Mode.TEXT
         self._worker: QThread | None = None
+        self._rec_proc = None
+        self._rec_path: Path | None = None
 
         self.setWindowTitle("J.A.R.V.I.S.")
         self.setMinimumSize(700, 600)
@@ -324,7 +311,7 @@ class JarvisWindow(QMainWindow):
         self._send_btn = QPushButton("Отправить")
         text_layout.addWidget(self._send_btn)
 
-        self._stop_btn = QPushButton("⏹ Стоп")
+        self._stop_btn = QPushButton("Стоп")
         self._stop_btn.setObjectName("stopBtn")
         self._stop_btn.setToolTip("Остановить ответ J.A.R.V.I.S.")
         self._stop_btn.setVisible(False)
@@ -342,7 +329,7 @@ class JarvisWindow(QMainWindow):
         self._voice_btn.setObjectName("voiceBtn")
         voice_layout.addWidget(self._voice_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self._voice_stop_btn = QPushButton("⏹ Стоп")
+        self._voice_stop_btn = QPushButton("Стоп")
         self._voice_stop_btn.setObjectName("stopBtn")
         self._voice_stop_btn.setToolTip("Остановить воспроизведение J.A.R.V.I.S.")
         self._voice_stop_btn.setVisible(False)
@@ -362,7 +349,8 @@ class JarvisWindow(QMainWindow):
         self._mode_btn.clicked.connect(self._toggle_mode)
         self._send_btn.clicked.connect(self._on_send_text)
         self._input.returnPressed.connect(self._on_send_text)
-        self._voice_btn.clicked.connect(self._on_voice_record)
+        self._voice_btn.pressed.connect(self._on_voice_press)
+        self._voice_btn.released.connect(self._on_voice_release)
         self._index_btn.clicked.connect(self._on_index_files)
         self._exit_btn.clicked.connect(self._on_exit)
         self._stop_btn.clicked.connect(self._on_stop)
@@ -430,14 +418,42 @@ class JarvisWindow(QMainWindow):
 
     # ── Голосовой ввод ───────────────────────────────────────
 
-    def _on_voice_record(self) -> None:
+    def _on_voice_press(self) -> None:
         if self._worker and self._worker.isRunning():
+            return
+        if self._rec_proc is not None:
+            return
+
+        from src.audio import recorder
+
+        try:
+            self._rec_proc, self._rec_path = recorder.start_recording()
+            self._status.setText("Запись... (отпустите чтобы отправить)")
+            self._voice_btn.setText("■")
+        except Exception as exc:
+            self._on_error(str(exc))
+
+    def _on_voice_release(self) -> None:
+        if self._rec_proc is None:
             return
 
         from src.audio import recorder, speaker
 
+        try:
+            rec_path = recorder.stop_recording(self._rec_proc, self._rec_path)
+        except Exception as exc:
+            self._rec_proc = None
+            self._rec_path = None
+            self._voice_btn.setText("🎤")
+            self._on_error(str(exc))
+            return
+
+        self._rec_proc = None
+        self._rec_path = None
+        self._voice_btn.setText("🎤")
+
         self._set_busy(True)
-        self._worker = VoiceWorker(self._engine, recorder, speaker, duration=5)
+        self._worker = VoiceWorker(self._engine, speaker, rec_path)
         self._worker.status.connect(lambda s: self._status.setText(s))
         self._worker.finished.connect(self._on_voice_reply)
         self._worker.error.connect(self._on_error)
