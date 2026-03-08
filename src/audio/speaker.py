@@ -19,6 +19,9 @@ log = logging.getLogger(__name__)
 # Голос по умолчанию — русский мужской (для русскоязычного общения)
 DEFAULT_VOICE = "ru-RU-DmitryNeural"
 
+# Текущий процесс mpv (для прерывания)
+_current_mpv_proc: subprocess.Popen | None = None
+
 
 def _check_mpv() -> str:
     path = shutil.which("mpv")
@@ -56,6 +59,19 @@ def _clean_for_tts(text: str) -> str:
     return text.strip()
 
 
+def stop() -> None:
+    """Остановить текущее воспроизведение TTS (убить mpv)."""
+    global _current_mpv_proc
+    if _current_mpv_proc is not None and _current_mpv_proc.poll() is None:
+        _current_mpv_proc.terminate()
+        try:
+            _current_mpv_proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            _current_mpv_proc.kill()
+        log.info("TTS: воспроизведение остановлено")
+    _current_mpv_proc = None
+
+
 def speak(text: str, voice: str = DEFAULT_VOICE) -> None:
     """
     Озвучить текст: edge-tts → mp3 → mpv.
@@ -81,10 +97,15 @@ def speak(text: str, voice: str = DEFAULT_VOICE) -> None:
         asyncio.run(_generate_tts(text, voice, tmp_path))
 
         log.info("TTS: воспроизведение через mpv")
-        subprocess.run(
+        global _current_mpv_proc
+        _current_mpv_proc = subprocess.Popen(
             [mpv, "--no-video", "--really-quiet", str(tmp_path)],
-            check=True,
-            timeout=120,
         )
+        try:
+            _current_mpv_proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            _current_mpv_proc.kill()
+        finally:
+            _current_mpv_proc = None
     finally:
         tmp_path.unlink(missing_ok=True)

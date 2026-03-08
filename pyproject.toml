@@ -16,6 +16,9 @@ dependencies = [
     "duckduckgo-search>=7.0.0",
     "pymupdf (>=1.27.1,<2.0.0)",
     "numpy (>=2.4.2,<3.0.0)",
+    "langchain (>=0.3)",
+    "langchain-community (>=0.3)",
+    "langchain-openai (>=0.3)",
 ]
 
 [tool.poetry]

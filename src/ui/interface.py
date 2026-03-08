@@ -104,6 +104,23 @@ QPushButton#voiceBtn:pressed {
     background-color: #8b5cf6;
     color: #0a0e17;
 }
+QPushButton#stopBtn {
+    background-color: #2a0a0a;
+    border: 2px solid #ef4444;
+    border-radius: 6px;
+    padding: 8px 18px;
+    font-size: 13px;
+    font-weight: bold;
+    color: #ef4444;
+}
+QPushButton#stopBtn:hover {
+    background-color: #ef4444;
+    color: #0a0e17;
+}
+QPushButton#stopBtn:pressed {
+    background-color: #b91c1c;
+    color: #ffffff;
+}
 QLabel#title {
     color: #00d4ff;
     font-size: 22px;
@@ -307,6 +324,12 @@ class JarvisWindow(QMainWindow):
         self._send_btn = QPushButton("Отправить")
         text_layout.addWidget(self._send_btn)
 
+        self._stop_btn = QPushButton("⏹ Стоп")
+        self._stop_btn.setObjectName("stopBtn")
+        self._stop_btn.setToolTip("Остановить ответ J.A.R.V.I.S.")
+        self._stop_btn.setVisible(False)
+        text_layout.addWidget(self._stop_btn)
+
         root.addWidget(self._text_panel)
 
         # ── Панель ввода (голос) ─────────────────────────────
@@ -318,6 +341,12 @@ class JarvisWindow(QMainWindow):
         self._voice_btn = QPushButton("🎤")
         self._voice_btn.setObjectName("voiceBtn")
         voice_layout.addWidget(self._voice_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self._voice_stop_btn = QPushButton("⏹ Стоп")
+        self._voice_stop_btn.setObjectName("stopBtn")
+        self._voice_stop_btn.setToolTip("Остановить воспроизведение J.A.R.V.I.S.")
+        self._voice_stop_btn.setVisible(False)
+        voice_layout.addWidget(self._voice_stop_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self._voice_panel.setVisible(False)
         root.addWidget(self._voice_panel)
@@ -336,10 +365,32 @@ class JarvisWindow(QMainWindow):
         self._voice_btn.clicked.connect(self._on_voice_record)
         self._index_btn.clicked.connect(self._on_index_files)
         self._exit_btn.clicked.connect(self._on_exit)
+        self._stop_btn.clicked.connect(self._on_stop)
+        self._voice_stop_btn.clicked.connect(self._on_stop)
 
     def _on_exit(self) -> None:
         """Выход из приложения."""
         QApplication.quit()
+
+    def _on_stop(self) -> None:
+        """Остановить текущий ответ и TTS."""
+        if self._worker and self._worker.isRunning():
+            self._worker.requestInterruption()
+            self._worker.quit()
+            self._worker.wait(300)
+            if self._worker.isRunning():
+                self._worker.terminate()
+            log.info("Worker остановлен пользователем")
+
+        # Останавливаем TTS если воспроизводится
+        try:
+            from src.audio import speaker
+            speaker.stop()
+        except Exception:
+            pass
+
+        self._append_message("J.A.R.V.I.S.", "*[Ответ остановлен]*")
+        self._set_busy(False)
 
     # ── Переключение режимов ─────────────────────────────────
 
@@ -434,7 +485,11 @@ class JarvisWindow(QMainWindow):
 
     def _set_busy(self, busy: bool) -> None:
         self._send_btn.setEnabled(not busy)
+        self._send_btn.setVisible(not busy)
+        self._stop_btn.setVisible(busy)
+        self._voice_btn.setVisible(not busy)
         self._voice_btn.setEnabled(not busy)
+        self._voice_stop_btn.setVisible(busy)
         self._input.setEnabled(not busy)
         self._animation.set_active(busy)
         if busy:

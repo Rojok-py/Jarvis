@@ -121,6 +121,40 @@ _RE_APPEND_FILE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# «Запиши/Сохрани [текст] в файл X» — явная запись содержимого без имени файла впереди
+_RE_WRITE_FILE = re.compile(
+    r"(?:запиши|сохрани|запишите|сохраните|write|save)\s+"
+    r"(?:это|следующее|текст|слова)?\s*"
+    r"(?:в\s+файл\s+|в\s+файле\s+|в\s+|to\s+file\s+|to\s+)(?P<file>[\w.\-/]+)"
+    r"(?:\s*[:,]?\s*(?P<content>.+))?",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# «В моём файле» / «из файла» / «расскажи про файл(ы)» / «что в data» → RAG/анализ
+_RE_FILE_QUERY = re.compile(
+    r"(?:"
+    r"в\s+(?:моем|моём|этом|нашем|данном|своём|своем)?\s*файл(?:е|ах)"
+    r"|из\s+(?:моего|этого|своего)?\s*файл(?:а|ов)"
+    r"|(?:прочитай|прочти|открой|читай)\s+(?:мой\s+|этот\s+|данный\s+)?файл"
+    r"|покажи\s+содержимое\s+файла"
+    r"|что\s+(?:есть|написано|содержит\s*ся)?\s*(?:в|во)\s+(?:моем|моём|этом)?\s*файл(?:е|ах)"
+    r"|расскажи\s+(?:про|о|об)\s+(?:файл(?:е|ах|ы|ов)?)"
+    r"|(?:что|чего|какие)\s+(?:в|за)\s+(?:файл(?:ах|е|ы|ов)?|папке\s+data|моих\s+файлах)"
+    r"|(?:у\s+тебя|у\s+тебя\s+есть|в\s+data)\s+(?:файл(?:ы|ов|ах)?|есть\s+файл(?:ы|ов)?)"    r"|у\s+тебя\s+в\s+папке\s+data"
+    r"|есть\s+файл(?:ы|ов)?\s+расскажи"    r"|(?:что|какие)\s+у\s+(?:тебя|меня)\s+файл(?:ы|ов|ах)?"
+    r"|про\s+(?:мои|свои|эти|все)\s+файл(?:ы|ах|ов)?"
+    r")",
+    re.IGNORECASE,
+)
+
+# «Агент / агенты / исследуй с агентами / dual agent» — запуск двухагентного пайплайна
+_RE_AGENTS = re.compile(
+    r"(?:запусти\s+агент(?:ов|а)?|используй\s+агент(?:ов|а)?|исследуй\s+с\s+агентами?"
+    r"|dual.?agent|агентный\s+поиск|через\s+агент(?:ов|а)?|ответь\s+через\s+агент(?:ов|а)?)"
+    r"(?:\s+(?:про\s+|о\s+|по\s+|на\s+тему\s+))?(?P<query>.*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 class JarvisEngine:
     """Обёртка над Groq API для J.A.R.V.I.S."""
@@ -214,6 +248,34 @@ class JarvisEngine:
             self._messages = [self._messages[0]] + self._messages[-40:]
 
         log.info("Groq → Text: %s", reply[:80])
+        return reply
+
+    def _search_complete(self, query: str, prompt: str) -> str:
+        """
+        Обработать результаты поиска через Groq без добавления в историю чата.
+        Добавляет в историю только финальный краткий ответ (без сырых данных поиска).
+        """
+        response = _retry_on_429(
+            self._client.chat.completions.create,
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                *self._messages[1:],   # история без system
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=2048,
+        )
+        reply = response.choices[0].message.content.strip()
+
+        # В историю добавляем только пользовательский запрос + краткий ответ
+        self._messages.append({"role": "user", "content": query})
+        self._messages.append({"role": "assistant", "content": reply})
+
+        if len(self._messages) > 41:
+            self._messages = [self._messages[0]] + self._messages[-40:]
+
+        log.info("Search → Groq: %s", reply[:80])
         return reply
 
     # ── Голосовой режим ──────────────────────────────────────
@@ -432,13 +494,23 @@ class JarvisEngine:
             log.info("Команда: веб-поиск '%s'", query)
             from src.tools.search import web_search
             results = web_search(query)
+            if not results or "не удалось" in results.lower() or results.strip() == "Результатов не найдено.":
+                return self._chat_complete(
+                    f"Пользователь спросил: «{text}». "
+                    "Поиск не дал результатов. Скажи об этом честно и предложи альтернативы."
+                )
             summary_prompt = (
-                f"Вот результаты поиска DuckDuckGo по запросу «{query}»:\n\n"
+                f"Ниже приведены РЕАЛЬНЫЕ актуальные результаты поиска DuckDuckGo "
+                f"по запросу «{query}».\n\n"
                 f"{results}\n\n"
-                "Дай краткий и полезный ответ на основе этих результатов. "
-                "Указывай источники."
+                "Используй эти данные как единственный источник информации. "
+                "Извлеки ключевые факты и дай чёткий, структурированный ответ. "
+                "Если это погода — укажи температуру, осадки, условия. "
+                "Если это новости — кратко изложи суть. "
+                "Указывай источники (URL). Отвечай на русском языке."
             )
-            return self.send_text(summary_prompt)
+            # Прямой вызов без добавления в историю чата
+            return self._search_complete(query, summary_prompt)
 
         if _RE_LIST_FILES.search(text):
             log.info("Команда: список файлов")
@@ -466,6 +538,15 @@ class JarvisEngine:
             log.info("Команда: RAG-запрос '%s'", query)
             return self.rag_query(query)
 
+        # ── Агентный поиск (LangChain dual-agent) ──
+        m = _RE_AGENTS.search(text)
+        if m:
+            query = (m.group("query") or "").strip().rstrip(".,;:!?")
+            if not query:
+                query = text
+            log.info("Команда: dual-agent '%s'", query)
+            return self._handle_dual_agent(query)
+
         # ── Создание файла ──
         m = _RE_CREATE_FILE.search(text)
         if m:
@@ -473,6 +554,14 @@ class JarvisEngine:
             raw_content = (m.group("content") or "").strip().rstrip(".,;:!?")
             log.info("Команда: создать файл '%s'", filename)
             return self._handle_create_file(filename, raw_content, text)
+
+        # ── Запись текста в файл (явная: «запиши X в файл Y») ──
+        m = _RE_WRITE_FILE.search(text)
+        if m:
+            filename = m.group("file").strip().rstrip(".,;:!?")
+            raw_content = (m.group("content") or "").strip()
+            log.info("Команда: запись в файл '%s'", filename)
+            return self._handle_write_to_file(filename, raw_content, text)
 
         # ── Дописать в файл ──
         m = _RE_APPEND_FILE.search(text)
@@ -490,22 +579,59 @@ class JarvisEngine:
             log.info("Команда: редактировать файл '%s'", filename)
             return self._handle_edit_file(filename, instruction, text)
 
+        # ── Обращение к файлам через естественный язык ──────────────────────
+        if _RE_FILE_QUERY.search(text):
+            log.info("Команда: запрос к файлам (natural language) → RAG")
+            files = self._get_all_data_files()
+            if files:
+                return self.rag_query(text)
+            return (
+                "В папке data/ пока нет файлов, сэр. Добавьте документы "
+                "и используйте «📑 Индексация» или скажите «индексируй файлы»."
+            )
+
+        # ── Упоминание конкретного имени файла из data/ («расскажи про Algoritm.pdf») ──
+        file_hit = self._detect_filename_in_text(text)
+        if file_hit:
+            log.info("Команда: упоминание файла '%s' → RAG", file_hit.name)
+            if not self._rag.is_indexed:
+                self.index_documents()
+            return self.rag_query(text)
+
         return None
 
     # ── Создание и редактирование файлов ────────────────────────
 
+    def _detect_filename_in_text(self, text: str) -> "Path | None":
+        """
+        Проверить, упоминается ли в тексте имя или часть имени файла из data/.
+        Возвращает Path если найдено совпадение, иначе None.
+        """
+        files = self._get_all_data_files()
+        if not files:
+            return None
+        text_lower = text.lower()
+        for f in files:
+            # Полное имя файла
+            if f.name.lower() in text_lower:
+                return f
+            # Без расширения
+            if f.stem.lower() in text_lower and len(f.stem) > 3:
+                return f
+            # Слова из имени (для «26.05.07 method 001» → «method 001» или «method»)
+            stem_words = re.split(r'[\s._\-]+', f.stem.lower())
+            meaningful = [w for w in stem_words if len(w) > 3]
+            if meaningful and all(w in text_lower for w in meaningful):
+                return f
+        return None
+
     def _handle_create_file(
         self, filename: str, raw_content: str, full_text: str
     ) -> str:
-        """Создать текстовый файл.  Если содержимое не указано явно — просим LLM сгенерировать."""
+        """Создать текстовый файл.  LLM генерирует / расширяет содержимое во всех случаях."""
         from src.tools.file_ops import create_text_file
 
-        if raw_content:
-            content = raw_content
-        else:
-            # Просим LLM сформировать содержимое файла по запросу
-            content = self._generate_file_content(filename, full_text)
-
+        content = self._generate_file_content(filename, full_text, hint=raw_content)
         path = create_text_file(filename, content)
         return (
             f"✅ Файл **{filename}** создан в `{path.parent.name}/`.\n\n"
@@ -517,26 +643,21 @@ class JarvisEngine:
     def _handle_append_file(
         self, filename: str, raw_content: str, full_text: str
     ) -> str:
-        """Дописать текст в конец существующего файла."""
+        """Дописать текст в конец существующего файла. LLM расширяет введённую идею."""
         from src.tools.file_ops import edit_text_file
 
-        if raw_content:
-            content = raw_content
-        else:
-            content = self._generate_file_content(filename, full_text)
+        content = self._generate_file_content(filename, full_text, hint=raw_content)
 
         try:
             path = edit_text_file(filename, append="\n" + content)
         except FileNotFoundError:
-            # Если файла нет — создаём
             from src.tools.file_ops import create_text_file
-
             path = create_text_file(filename, content)
             return (
                 f"Файл **{filename}** не существовал — создал новый в "
                 f"`{path.parent.name}/` и записал содержимое."
             )
-        return f"✅ Дописал в **{filename}** ({path.parent.name}/)."
+        return f"✅ Дописал в **{filename}** ({path.parent.name}/):\n```\n{content[:300]}```"
 
     def _handle_edit_file(
         self, filename: str, instruction: str, full_text: str
@@ -588,14 +709,110 @@ class JarvisEngine:
             + "\n```"
         )
 
-    def _generate_file_content(self, filename: str, user_request: str) -> str:
-        """Попросить LLM сгенерировать содержимое файла по запросу."""
-        prompt = (
-            f"Пользователь просит создать файл «{filename}».\n"
-            f"Полный запрос: {user_request}\n\n"
-            "Сгенерируй содержимое этого файла. "
-            "Верни ТОЛЬКО текст файла — без объяснений, без обёрток в markdown-блоки."
+    def _handle_write_to_file(
+        self, filename: str, raw_content: str, full_text: str
+    ) -> str:
+        """Записать (создать или перезаписать) файл.
+
+        Всегда генерирует содержимое через LLM:
+        - если пользователь дал текст/тему — LLM расширяет это в полноценную запись
+        - если ничего нет — LLM генерирует с нуля по имени файла и полному запросу
+        """
+        from src.tools.file_ops import create_text_file, edit_text_file
+
+        if raw_content:
+            # Просим LLM расширить/улучшить введённый пользователем текст
+            prompt = (
+                f"Пользователь хочет записать в файл «{filename}» следующее:\n"
+                f"{raw_content}\n\n"
+                "Напиши полноценное, законченное содержимое файла на основе этого текста. "
+                "Сохрани смысл, но оформи красиво и структурировано. "
+                "Верни ТОЛЬКО текст файла — без объяснений и без markdown-обёрток."
+            )
+        else:
+            prompt = (
+                f"Пользователь просит записать что-то в файл «{filename}».\n"
+                f"Полный запрос: {full_text}\n\n"
+                "Сгенерируй подходящее содержимое файла. "
+                "Верни ТОЛЬКО текст файла — без объяснений и без markdown-обёрток."
+            )
+
+        response = _retry_on_429(
+            self._client.chat.completions.create,
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.5,
+            max_tokens=2048,
         )
+        content = self._strip_markdown_wrapper(
+            response.choices[0].message.content.strip()
+        )
+
+        try:
+            path = edit_text_file(filename, new_content=content)
+            action = "Обновлён"
+        except FileNotFoundError:
+            path = create_text_file(filename, content)
+            action = "Создан"
+
+        log.info("%s файл: %s", action, path)
+        return (
+            f"✅ {action} файл **{filename}** в `{path.parent.name}/`.\n\n"
+            f"Содержимое ({len(content)} символов):\n"
+            f"```\n{content[:500]}"
+            + ("\n… [обрезано]" if len(content) > 500 else "")
+            + "\n```"
+        )
+
+    def _handle_dual_agent(self, query: str) -> str:
+        """Запустить LangChain dual-agent (Research + Editor) и вернуть ответ."""
+        try:
+            from src.core.agents import run_dual_agent
+
+            log.info("Запуск dual-agent pipeline для: '%s'", query[:80])
+            result = run_dual_agent(query)
+
+            search_note = ""
+            if result["searched"]:
+                search_note = (
+                    "\n\n*🔍 Выполнен автоматический веб-поиск DuckDuckGo*"
+                )
+
+            return (
+                f"**[Research Agent → Editor Agent]**\n\n"
+                f"{result['final']}"
+                f"{search_note}"
+            )
+        except Exception as exc:
+            log.error("Ошибка dual-agent: %s", exc)
+            # Фолбэк на обычный Groq чат
+            return self.send_text(query)
+
+    def _generate_file_content(
+        self, filename: str, user_request: str, hint: str = ""
+    ) -> str:
+        """Попросить LLM сгенерировать / расширить содержимое файла.
+
+        hint : str
+            Если пользователь дал текст/тему — LLM расширяет его в полноценную запись.
+        """
+        if hint:
+            prompt = (
+                f"Пользователь хочет записать в файл «{filename}» следующее:\n{hint}\n\n"
+                "Напиши полноценное, законченное содержимое файла на основе этой темы или текста. "
+                "Сохрани смысл, но оформи красиво и структурированно. "
+                "Верни ТОЛЬКО текст файла — без объяснений и без markdown-обёрток."
+            )
+        else:
+            prompt = (
+                f"Пользователь просит создать файл «{filename}».\n"
+                f"Полный запрос: {user_request}\n\n"
+                "Сгенерируй подходящее содержимое файла. "
+                "Верни ТОЛЬКО текст файла — без объяснений и без markdown-обёрток."
+            )
         response = _retry_on_429(
             self._client.chat.completions.create,
             model=MODEL,
