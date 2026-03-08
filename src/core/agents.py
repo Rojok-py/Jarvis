@@ -1,18 +1,3 @@
-"""
-J.A.R.V.I.S. Dual-Agent System — LangChain Research + Editor pipeline.
-
-Два взаимодействующих агента на базе LangChain:
-
-1. **Research Agent** — принимает запрос, ищет информацию через DuckDuckGo
-   (или по ключевым словам погоды/новостей) и составляет подробный черновик.
-
-2. **Editor Agent** — получает черновик, проверяет его на логику,
-   лаконичность и форматирует в стиле J.A.R.V.I.S.
-
-Если ответ требует свежих данных (новости, погода, актуальные события) —
-система автоматически инициирует поиск в интернете.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -69,8 +54,12 @@ def _search_web(query: str, max_results: int = 6) -> str:
     try:
         from duckduckgo_search import DDGS
 
+        # Авто-определение региона: кириллица → ru-ru
+        import re
+        region = "ru-ru" if re.search(r"[\u0400-\u04ff]", query) else "wt-wt"
+
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
+            results = list(ddgs.text(query, region=region, max_results=max_results))
         lines = []
         for i, r in enumerate(results, 1):
             body = r.get("body", "")
