@@ -26,3 +26,5 @@ data/input.wav
 # OS
 .DS_Store
 Thumbs.db
+
+data/
